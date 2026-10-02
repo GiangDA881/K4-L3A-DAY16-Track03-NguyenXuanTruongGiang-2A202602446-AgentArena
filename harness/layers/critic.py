@@ -70,7 +70,11 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._grounding import citations_of, source_for
 from harness.middleware import Middleware
+
+#: Chỗ mô hình dán hai nửa câu của hai tài liệu lại với nhau.
+_JOINER = " và "
 
 
 class Critic(Middleware):
@@ -79,16 +83,57 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        kept, halves, dropped = [], [], 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            # Giữ nguyên chữ: claim nào bằng chứng đã thấy đỡ được thì giữ.
+            if isinstance(text, str) and source_for(ctx, text) is not None:
+                kept.append(claim)
+                continue
+            split = _split_fused(ctx, text) if isinstance(text, str) else None
+            if split:
+                halves.append(split)
+                kept.extend(split)
+            else:
+                dropped += 1  # không nằm trong bằng chứng nào: bịa -> bỏ
+        ctx.state["critic_dropped"] = dropped
+        report["claims"] = kept
+        report["citations"] = citations_of(kept)
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = (
+                "Không đủ căn cứ: các tài liệu đã truy xuất không chứa thông tin "
+                "trả lời câu hỏi này, nên tôi không đưa ra kết luận."
+            )
+        elif halves:
+            # Hai nguồn nói khác nhau: nêu cả hai phía rồi từ chối chọn bừa.
+            report["abstain"] = True
+            sides = " ; ".join(
+                f"«{a['text']}» ({a['doc_id']}) — «{b['text']}» ({b['doc_id']})"
+                for a, b in halves
+            )
+            report["answer"] = (
+                f"Các tài liệu mâu thuẫn nhau: {sides}. "
+                "Không đủ căn cứ để khẳng định bên nào đúng."
+            )
+        return report
+
+
+def _split_fused(ctx, text: str):
+    """Tách câu mô hình ghép từ hai tài liệu bằng " và " thành hai trích dẫn.
+
+    Mỗi nửa vẫn là chữ của mô hình (một substring), nên vẫn qua kiểm tra
+    provenance; chỉ chấp nhận khi hai nửa thuộc HAI tài liệu khác nhau.
+    """
+    start = text.find(_JOINER)
+    while start != -1:
+        left, right = text[:start], text[start + len(_JOINER):]
+        left_doc = source_for(ctx, left)
+        right_doc = source_for(ctx, right, load={left_doc: 1} if left_doc else None)
+        if left_doc and right_doc and left_doc != right_doc:
+            return [{"text": left, "doc_id": left_doc}, {"text": right, "doc_id": right_doc}]
+        start = text.find(_JOINER, start + 1)
+    return None

@@ -61,7 +61,9 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+import time
+
+from arena.model import RealModelError, is_degraded
 
 from harness.middleware import Middleware
 
@@ -87,15 +89,59 @@ class Retry(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        limit = ctx.max_tool_calls
+        while attempts < self.max_attempts and _broken(result):
+            if _deterministic(result):
+                break  # gọi lại cũng ra đúng lỗi đó, chỉ tốn ngân sách
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        return result
+
+    def wrap_model_call(self, ctx, call, messages):
+        """Endpoint thật chập chờn (502, 429, timeout): một lỗi tạm thời
+        không được giết cả lượt chạy. Chỉ thử lại đúng các lỗi đó; mọi lỗi
+        khác (key sai, model không tồn tại, bug) vẫn nổ to như cũ."""
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return call(messages)
+            except RealModelError as exc:
+                if attempt >= self.max_attempts or not _transient(exc):
+                    raise
+                ctx.state["model_retries"] = ctx.state.get("model_retries", 0) + 1
+                time.sleep(MODEL_RETRY_BACKOFF_SECONDS * attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+#: Chờ trước lần gọi model kế tiếp (nhân với số lần đã thử).
+MODEL_RETRY_BACKOFF_SECONDS = 2.0
+
+_TRANSIENT_MARKERS = (
+    "http error 500", "http error 502", "http error 503", "http error 504",
+    "http error 429", "timed out", "timeout", "connection reset",
+    "remote end closed", "temporarily",
+)
+
+
+def _transient(exc) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
+def _broken(result) -> bool:
+    if result is None or not getattr(result, "ok", False):
+        return True
+    content = getattr(result, "content", "")
+    return is_degraded(content if isinstance(content, str) else str(content))
+
+
+def _deterministic(result) -> bool:
+    """Lỗi do chính tham số (tài liệu không tồn tại, biểu thức sai, công cụ
+    lạ, bị `budget_policy` chặn) chứ không phải do tầng công cụ chập chờn."""
+    error = getattr(result, "error", None) or ""
+    return isinstance(error, str) and error.startswith(
+        ("doc not found:", "invalid expression:", "unknown tool:", "budget exhausted:")
+    )
